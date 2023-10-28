@@ -1,1 +1,435 @@
 GOOGLE COLLAB NOTEBOOK
+................................................................................................................................
+import subprocess
+
+from sys import platform as sys_platform
+
+status, ffmpeg_version = subprocess.getstatusoutput("ffmpeg -version")
+
+if status != 0:
+  from platform import platform
+
+  if sys_platform == 'linux' and 'ubuntu' in platform().lower():
+    !apt install ffmpeg
+  else:
+    print("Install ffmpeg: https://ffmpeg.org/download.html")
+else:
+  print(ffmpeg_version.split('\n')[0])
+
+  ! pip install git+https://github.com/openai/whisper.git@7858aa9c08d98f75575035ecd6481f462d66ca27 numpy scipy torch deepl
+try:
+  import io
+  import ffmpeg
+  import numpy as np
+
+  # Only available in Google Colab
+  from google.colab.output import eval_js
+
+  from IPython.display import HTML, Audio
+  from scipy.io.wavfile import write, read as wav_read
+  from base64 import b64decode
+  from os.path import isfile
+
+  AUDIO_HTML = """
+  <script>
+  var my_div = document.createElement("DIV");
+  var my_p = document.createElement("P");
+  var my_btn = document.createElement("BUTTON");
+  var t = document.createTextNode("Starting recording...");
+
+  my_btn.appendChild(t);
+  my_div.appendChild(my_btn);
+  document.body.appendChild(my_div);
+
+  var base64data = 0;
+  var reader;
+  var recorder, gumStream;
+  var recordButton = my_btn;
+
+  var handleSuccess = function(stream) {
+    gumStream = stream;
+    var options = {
+      bitsPerSecond: 16000,
+      mimeType : 'audio/webm;codecs=opus' //codecs=pcm
+    };
+    recorder = new MediaRecorder(stream, options);
+    //recorder = new MediaRecorder(stream);
+
+    recorder.ondataavailable = function(e) {
+      var url = URL.createObjectURL(e.data);
+      var preview = document.createElement('audio');
+      preview.controls = true;
+      preview.src = url;
+      document.body.appendChild(preview);
+
+      reader = new FileReader();
+      reader.readAsDataURL(e.data);
+      reader.onloadend = function() {
+        base64data = reader.result;
+        //console.log("reader.onloadend: " + base64data);
+      }
+    };
+    recorder.start();
+    recordButton.innerText = "🔴 Recording... press to STOP";
+  };
+
+  navigator.mediaDevices.getUserMedia({audio: true}).then(handleSuccess);
+
+  function toggleRecording() {
+    if (recorder && recorder.state == "recording") {
+        recorder.stop();
+        gumStream.getAudioTracks()[0].stop();
+        recordButton.innerText = "Saving the recording... please wait!";
+    }
+  }
+
+  // https://stackoverflow.com/a/951057
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  var data = new Promise(resolve => {
+    recordButton.onclick = () => {
+      toggleRecording();
+
+      sleep(2000).then(() => {
+        // wait 2000ms for the data to be available...
+        //console.log("resolve data: " + base64data);
+        resolve(base64data.toString());
+      });
+    }
+  });
+
+  function doneRecording(recording_file) {
+    my_div.removeChild(recordButton);
+    my_p.innerText = recording_file;
+    my_div.appendChild(my_p);
+  }
+
+  </script>
+  """
+
+  def get_audio():
+    display(HTML(AUDIO_HTML))
+    data = eval_js("data")
+    binary = b64decode(data.split(',')[1])
+    
+    process = (ffmpeg
+      .input('pipe:0')
+      .output('pipe:1', format='wav')
+      .run_async(pipe_stdin=True, pipe_stdout=True, pipe_stderr=True, quiet=True, overwrite_output=True)
+    )
+    output, err = process.communicate(input=binary)
+    
+    riff_chunk_size = len(output) - 8
+    # Break up the chunk size into four bytes, held in b.
+    q = riff_chunk_size
+    b = []
+    for i in range(4):
+      q, r = divmod(q, 256)
+      b.append(r)
+
+    # Replace bytes 4:8 in proc.stdout with the actual size of the RIFF chunk.
+    riff = output[:4] + bytes(b) + output[8:]
+
+    sr, audio = wav_read(io.BytesIO(riff))
+
+    return audio, sr
+
+  recording_file = "recording.wav" #@param {type:"string"}
+
+  if isfile(recording_file):
+    print(f"{recording_file} already exists, if you want to create another recording with the same name, delete it first")
+  else:
+    # record microphone
+    audio, sr = get_audio()
+
+    # write recording
+    write(recording_file, sr, audio)
+
+    eval_js(f'doneRecording("{recording_file}")')
+except ImportError:
+  print("Recording only available in Google Colab")
+!pip install noisereduce
+from scipy.io import wavfile
+import noisereduce as nr
+# load data
+rate, data = wavfile.read("/content/recording.wav")
+# perform noise reduction
+reduced_noise = nr.reduce_noise(y=data, sr=rate)
+wavfile.write("mywav_reduced_noise.wav", rate, reduced_noise)
+import os
+import whisper
+from whisper.utils import format_timestamp, get_writer, WriteTXT
+
+import numpy as np
+
+try:
+  import tensorflow  # required in Colab to avoid protobuf compatibility issues
+except ImportError:
+  pass
+
+import torch
+
+# select task
+
+task = "Transcribe" #@param ["Transcribe", "Translate to English"]
+
+task = "transcribe" if task == "Transcribe" else "translate"
+
+# select audio file
+
+audio_file = "recording.wav" #@param {type:"string"}
+
+audio_files = audio_file.split(',')
+
+# set model
+
+use_model = "large-v2" #@param ["tiny", "base", "small", "medium", "large-v1", "large-v2"]
+
+# detect device
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+print(f"Using {'GPU' if DEVICE == 'cuda' else 'CPU ⚠️'}")
+
+# https://medium.com/analytics-vidhya/the-google-colab-system-specification-check-69d159597417
+if DEVICE == "cuda":
+  !nvidia-smi -L
+else:
+  if sys_platform == 'linux':
+    !lscpu | grep "Model name" | awk '{$1=$1};1'
+  
+  print("Not using GPU can result in a very slow execution")
+  print("Ensure Hardware accelerator by GPU is enabled in Google Colab: Runtime > Change runtime type")
+
+  if use_model not in ['tiny', 'base', 'small']:
+    print("You may also want to try a smaller model (tiny, base, small)")
+
+# select language
+
+WHISPER_LANGUAGES = [k.title() for k in whisper.tokenizer.TO_LANGUAGE_CODE.keys()]
+
+language = "Auto-Detect" #@param ["Auto-Detect", "Afrikaans", "Albanian", "Amharic", "Arabic", "Armenian", "Assamese", "Azerbaijani", "Bashkir", "Basque", "Belarusian", "Bengali", "Bosnian", "Breton", "Bulgarian", "Burmese", "Castilian", "Catalan", "Chinese", "Croatian", "Czech", "Danish", "Dutch", "English", "Estonian", "Faroese", "Finnish", "Flemish", "French", "Galician", "Georgian", "German", "Greek", "Gujarati", "Haitian", "Haitian Creole", "Hausa", "Hawaiian", "Hebrew", "Hindi", "Hungarian", "Icelandic", "Indonesian", "Italian", "Japanese", "Javanese", "Kannada", "Kazakh", "Khmer", "Korean", "Lao", "Latin", "Latvian", "Letzeburgesch", "Lingala", "Lithuanian", "Luxembourgish", "Macedonian", "Malagasy", "Malay", "Malayalam", "Maltese", "Maori", "Marathi", "Moldavian", "Moldovan", "Mongolian", "Myanmar", "Nepali", "Norwegian", "Nynorsk", "Occitan", "Panjabi", "Pashto", "Persian", "Polish", "Portuguese", "Punjabi", "Pushto", "Romanian", "Russian", "Sanskrit", "Serbian", "Shona", "Sindhi", "Sinhala", "Sinhalese", "Slovak", "Slovenian", "Somali", "Spanish", "Sundanese", "Swahili", "Swedish", "Tagalog", "Tajik", "Tamil", "Tatar", "Telugu", "Thai", "Tibetan", "Turkish", "Turkmen", "Ukrainian", "Urdu", "Uzbek", "Valencian", "Vietnamese", "Welsh", "Yiddish", "Yoruba"]
+
+if language == "Auto-Detect":
+  language = "detect"
+
+if language and language != "detect" and language not in WHISPER_LANGUAGES:
+  print(f"\nLanguage '{language}' is invalid")
+  language = "detect"
+
+if language and language != "detect":
+  print(f"\nLanguage: {language}")
+
+# load model
+
+MODELS_WITH_ENGLISH_VERSION = ["tiny", "base", "small", "medium"]
+
+if language == "English" and use_model in MODELS_WITH_ENGLISH_VERSION:
+  use_model += ".en"
+
+print(f"\nLoading {use_model} model...")
+
+model = whisper.load_model(use_model, device=DEVICE)
+
+print(
+    f"Model {use_model} is {'multilingual' if model.is_multilingual else 'English-only'} "
+    f"and has {sum(np.prod(p.shape) for p in model.parameters()):,d} parameters.\n"
+)
+
+# set options
+
+coherence_preference = "More coherence, but may repeat text" #@param ["More coherence, but may repeat text", "Less repetitions, but may have less coherence"]
+
+## Info: https://github.com/openai/whisper/blob/main/whisper/transcribe.py#L19
+options = {
+    'task': task,
+    'verbose': True,
+    'fp16': DEVICE == 'cuda',
+    'best_of': 5,
+    'beam_size': 5,
+    'patience': None,
+    'length_penalty': None,
+    'suppress_tokens': '-1',
+    'temperature': (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+    'condition_on_previous_text': coherence_preference == "More coherence, but may repeat text",
+}
+
+if DEVICE == 'cpu':
+  torch.set_num_threads(os.cpu_count())
+
+# execute task
+# !whisper "{audio_file}" --task {task} --model {use_model} --output_dir {output_dir} --device {DEVICE} --verbose {options['verbose']}
+
+if task == "translate":
+  print("-- TRANSLATE TO ENGLISH --")
+else:
+  print("-- TRANSCRIPTION --")
+
+results = {} # audio_path to result
+
+for audio_path in audio_files:
+  audio_path = audio_path.strip()
+  
+  print(f"\nProcessing: {audio_path}\n")
+
+  # detect language
+  detect_language = not language or language == "detect"
+  if detect_language:
+    # load audio and pad/trim it to fit 30 seconds
+    audio = whisper.load_audio(audio_path)
+    audio = whisper.pad_or_trim(audio)
+
+    # make log-Mel spectrogram and move to the same device as the model
+    mel = whisper.log_mel_spectrogram(audio).to(model.device)
+
+    # detect the spoken language
+    _, probs = model.detect_language(mel)
+
+    language_code = max(probs, key=probs.get)
+    options['language'] = whisper.tokenizer.LANGUAGES[language_code].title()
+    
+    print(f"Detected language: {options['language']}\n")
+  else:
+    options['language'] = language
+
+  # transcribe
+  result = whisper.transcribe(model, audio_path, **options)
+
+  for segment in result['segments']:
+    segment['text'] = segment['text'].strip()
+  
+  result['text'] = '\n'.join(map(lambda segment: segment['text'], result['segments']))
+
+  results[audio_path] = result
+# set output folder
+output_dir = "n.txt"
+
+# set output formats: https://github.com/openai/whisper/blob/7858aa9c08d98f75575035ecd6481f462d66ca27/whisper/utils.py#L145
+output_formats = "txt,vtt,srt,tsv,json" #@param ["txt,vtt,srt,tsv,json", "txt,vtt,srt", "txt,vtt", "txt,srt", "txt", "vtt", "srt", "tsv", "json"] {allow-input: true}
+output_formats = output_formats.split(',')
+
+from typing import TextIO
+
+class WriteText(WriteTXT):
+
+  def write_result(self, result: dict, file: TextIO):
+    print(result['text'], file=file, flush=True)
+
+
+def write_result(result, output_format, output_file_name):
+  output_format = output_format.strip()
+
+  # start captions in non-zero timestamp (some media players does not detect the first caption)
+  fix_vtt = output_format == 'vtt' and result['segments'] and result['segments'][0].get('start') == 0
+  
+  if fix_vtt:
+    result['segments'][0]['start'] += 1/1000 # +1ms
+
+  # write result in the desired format
+  writer = WriteText(output_dir) if output_format == 'txt' else get_writer(output_format, output_dir)
+  writer(result, output_file_name)
+
+  if fix_vtt:
+    result['segments'][0]['start'] = 0 # reset change
+
+  output_file_path = os.path.join(output_dir, f"{output_file_name}.{output_format}")
+  print(output_file_path)
+
+# save results
+
+print("Writing results...")
+
+os.makedirs(output_dir, exist_ok=True)
+
+for audio_path, result in results.items():
+  print(end='\n')
+  
+  output_file_name = os.path.splitext(os.path.basename(audio_path))[0]
+
+  for output_format in output_formats:
+    write_result(result, output_format, output_file_name)
+! pip install -q kaggle
+from google.colab import files
+files.upload()
+! mkdir ~/.kaggle
+! cp kaggle.json ~/.kaggle/
+! chmod 600 ~/.kaggle/kaggle.json
+! kaggle datasets list
+! kaggle datasets download -d uwrfkaggler/ravdess-emotional-speech-audio
+! kaggle datasets download -d uwrfkaggler/ravdess-emotional-speech-audio
+! mkdir ravdess-emotional-speech-audio
+! unzip ravdess-emotional-speech-audio.zip -d ravdess-emotional-speech-audio
+import pandas as pd
+import librosa
+import os, glob
+import numpy as np
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings('ignore')
+for dirname, _, filenames in os.walk('/ravdess-emotional-speech-audio/'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+   def extract_feature(file_name):
+    X, sample_rate = librosa.load(file_name)
+    stft=np.abs(librosa.stft(X))
+    result=np.array([])
+    mfccs=np.mean(librosa.feature.mfcc(y=X, sr=sample_rate, n_mfcc=40).T,axis=0)
+    result=np.hstack((result, mfccs))
+    chroma=np.mean(librosa.feature.chroma_stft(S=stft, sr=sample_rate).T,axis=0)
+    result=np.hstack((result, chroma))
+    mel=np.mean(librosa.feature.melspectrogram(X, sr=sample_rate).T,axis=0)
+    result=np.hstack((result, mel))
+    return result     
+emotions={
+  '01':'neutral',
+  '02':'calm',
+  '03':'happy',
+  '04':'sad',
+  '05':'angry',
+  '06':'fearful',
+  '07':'disgust',
+  '08':'surprised'
+}
+
+def gender(g):
+    if int(g[0:2]) % 2 == 0:
+        return 'female'
+    else:
+        return 'male'
+def load_data(test_size=0.2):
+    x,y=[],[]
+    for file in tqdm(glob.glob("ravdess-emotional-speech-audio/Actor_*/*.wav")):
+        file_name=os.path.basename(file)
+        emotion=emotions[file_name.split("-")[2]] + '_' + gender(file_name.split("-")[-1])
+        feature=extract_feature(file)
+        x.append(feature)
+        y.append(emotion)
+    return train_test_split(np.array(x), y, test_size=test_size, random_state=1)
+X_train, X_val, y_train, y_val = load_data()
+print((X_train.shape[0], X_val.shape[0]))
+from sklearn.preprocessing import StandardScaler
+
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_val = scaler.transform(X_val)
+print(f'Features extracted: {X_train.shape[1]}')
+from sklearn.neural_network import MLPClassifier
+
+model=MLPClassifier(alpha=0.01, batch_size=256, epsilon=1e-08, hidden_layer_sizes=(300,), learning_rate='adaptive', max_iter=500)
+model.fit(X_train,y_train)
+print(model.score(X_train, y_train))
+y_pred=model.predict(X_val)
+print(model.score(X_val, y_val))
+x_audio = []
+x_audio.append(audio)
+np.array(x_audio)
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_audio_val = scaler.transform(x_audio)
+y_pred_audio=model.predict(X_audio_val)
+hasil = str(y_pred_audio[0])
+gender_value = hasil.split("_")[1]
+print("The system detects that you are a",gender_value)
